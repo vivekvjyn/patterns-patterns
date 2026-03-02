@@ -3,3 +3,9 @@ checkpoints/
 runs/
 **/__pycache__/
 *.egg-info/
+
+bass.wav
+drums.wav
+vocals.wav
+other.wav
+main.py
