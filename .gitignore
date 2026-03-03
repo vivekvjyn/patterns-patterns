@@ -8,4 +8,6 @@ bass.wav
 drums.wav
 vocals.wav
 other.wav
+mix-small.wav
 main.py
+spectrogram_with_pitch.png
