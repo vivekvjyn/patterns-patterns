@@ -8,6 +8,7 @@ bass.wav
 drums.wav
 vocals.wav
 other.wav
-mix-small.wav
+mix.wav
 main.py
 spectrogram_with_pitch.png
+self_similarity_matrix.png

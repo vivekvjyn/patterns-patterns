@@ -1,106 +1,95 @@
 import torch
-from demucs.pretrained import get_model
-from demucs.apply import apply_model
 import torchaudio
-import compiam
-from compiam.melody.pitch_extraction import Melodia
-import librosa
-from swift_f0 import SwiftF0
-import matplotlib.pyplot as plt
 import numpy as np
-import crepe
-from bs_roformer import MODEL_REGISTRY, DEFAULT_MODEL, get_model_from_config
+import matplotlib.pyplot as plt
+from utils.dataset import Dataset
+# import cosine Similarity
+from sklearn.metrics.pairwise import cosine_similarity
 
 class Pattern:
-    def __init__(self, srcsep_algorithm='ht-demucs', pe_algorithm='crepe'):
+    def __init__(self, source_separator, pitch_extractor, tonic_identifier, embedder):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Source separator setup
-        self.srcsep_algorithm = srcsep_algorithm
-        if self.srcsep_algorithm == 'ht-demucs':
-            self.source_separator = get_model(name="htdemucs")
-            self.source_separator.eval()
-            self.source_separator.to(self.device)
-        elif self.srcsep_algorithm == 'bs-roformer':
-            entry = MODEL_REGISTRY.get(DEFAULT_MODEL)
-            config = ConfigDict(yaml.safe_load(open(f"models/{entry.slug}/{entry.config}")))
-            self.source_separator = get_model_from_config("bs_roformer", config)
-            state_dict = torch.load(f"models/{entry.slug}/{entry.checkpoint}", map_location="cpu")
-            self.source_separator.load_state_dict(state_dict)
-
-        # Pitch extractor setup
-        self.pe_algorithm = pe_algorithm
-        if self.pe_algorithm == 'melodia':
-            self.pitch_extractor = Melodia()
-        elif self.pe_algorithm == 'swiftf0':
-            self.pitch_extractor = SwiftF0()
-        elif self.pe_algorithm == 'crepe':
-            self.pitch_extractor = crepe
-        elif self.pe_algorithm == 'ftanet-carnatic':
-            self.pitch_extractor = compiam.load_model("melody:ftanet-carnatic")
-        else:
-            raise ValueError(f"Unsupported pitch extraction algorithm: {self.pe_algorithm}.")
-
+        self.source_separator = source_separator
+        self.pitch_extractor = pitch_extractor
+        self.tonic_identifier = tonic_identifier
+        self.embedder = embedder
 
     def __call__(self, audio_path):
         audio, sample_rate = torchaudio.load(audio_path)
 
-        vocals = self._separate_sources(audio, sample_rate)
+        vocals = self.source_separator(audio, sample_rate)
 
-        pitch = self._extract_pitch(vocals, sample_rate)
+        times, pitch = self.pitch_extractor(vocals, sample_rate)
 
-    def _separate_sources(self, audio, sample_rate):
-        audio = audio.unsqueeze(0).to(self.device)
-        if audio.shape[1] == 1:
-            audio = audio.repeat(1, 2, 1)
+        tonic = self.tonic_identifier(audio, sample_rate)
 
-        if self.srcsep_algorithm == 'ht-demucs':
-            with torch.no_grad():
-                sources = apply_model(self.source_separator, audio, shifts=1, split=True)
-                vocals = sources[0, 3].cpu().numpy()
-                vocals = np.mean(vocals, axis=0)
-        elif self.srcsep_algorithm == 'bs-roformer':
-            with torch.no_grad():
-                sources = self.source_separator(audio)
-                vocals = sources[0, self.source_separator.sources.index("vocals")]
-                vocals = vocals.cpu().numpy()
-                vocals = np.mean(vocals, axis=0)
+        pitch_cents = self.hz_to_cents(pitch, tonic)
 
-        torchaudio.save("vocals.wav", torch.from_numpy(vocals).unsqueeze(0), sample_rate)
+        splits, num_splits = self.split_pitch(pitch_cents)
 
-        return vocals
+        dataset = Dataset(splits)
+        data_loader = torch.utils.data.DataLoader(dataset, batch_size=num_splits, shuffle=False)
+        embeddings = self.embedder(data_loader)
 
-    def _extract_pitch(self, audio, sample_rate):
-        if self.pe_algorithm == 'melodia':
-            pitch_track = self.pitch_extractor.extract(audio, sample_rate)
-            times = pitch_track[:, 0]
-            pitch = pitch_track[:, 1]
-        elif self.pe_algorithm == 'swiftf0':
-            pitch_result = self.pitch_extractor.detect_from_array(audio, sample_rate)
-            pitch = pitch_result.pitch_hz
-            pitch[~pitch_result.voicing] = 0.0
-            times = pitch_result.timestamps
-        elif self.pe_algorithm == 'crepe':
-            times, pitch, confidence, _ = self.pitch_extractor.predict(audio, sample_rate, viterbi=True)
-            pitch[confidence < 0.5] = 0.0
-        elif self.pe_algorithm == 'ftanet-carnatic':
-            pitch_track = self.pitch_extractor.predict(audio, sample_rate)
-            times = pitch_track[:, 0]
-            pitch = pitch_track[:, 1]
+        self_similarity_matrix = self.compute_self_similarity(embeddings)
 
-        # plot pitch on spectrogram
-        plt.figure(figsize=(20, 6))
-        # compute Spectrogram
-        S = librosa.stft(audio, n_fft=2048, hop_length=512)
-        S_db = librosa.amplitude_to_db(np.abs(S), ref=np.max)
-        plt.pcolormesh(librosa.times_like(S_db, sr=sample_rate, hop_length=512), librosa.fft_frequencies(sr=sample_rate, n_fft=2048), S_db, shading='gouraud')
-        plt.plot(times, pitch, color='r', label='Pitch')
-        plt.legend()
-        plt.title('Spectrogram with Pitch')
-        #plt.colorbar(format='%+2.0f dB')
-        plt.ylim(0, 600)
+        self.visualize_self_similarity(self_similarity_matrix, pitch_cents, times)
+
+
+    def hz_to_cents(self, frequencies, tonic):
+        pitch_cents = 1200 * np.log2(frequencies / tonic)
+        pitch_cents[~np.isfinite(pitch_cents)] = np.nan
+
+        return pitch_cents
+
+    def split_pitch(self, x, window_size=100):
+        num_splits = len(x) // window_size
+        split_size = len(x) // num_splits
+        splits = [x[i*split_size : (i+1)*split_size] for i in range(num_splits)]
+
+        normalized_splits = self.normalize(splits)
+
+        return normalized_splits, num_splits
+
+    def normalize(self, data, range_min=-4200, range_max=4200):
+        normalized_data = []
+        for sample in data:
+            normalized_sample = (sample - range_min) / (range_max - range_min)
+            normalized_data.append(normalized_sample)
+        return np.array(normalized_data)
+
+    def compute_self_similarity(self, embeddings):
+        similarity_matrix = cosine_similarity(embeddings)
+        return similarity_matrix
+
+    def visualize_self_similarity(self, similarity_matrix, pitch, times):
+        plt.figure(figsize=(18, 18))
+
+        # First subplot: Flipped pitch vs time
+        plt.subplot(2, 2, 1)
+        plt.plot(np.flip(pitch), np.flip(times))
+        plt.xticks([])
+        plt.yticks([])
+
+        # Second subplot: Self-similarity matrix
+        plt.subplot(2, 2, 2)
+        plt.imshow(np.flip(similarity_matrix, 0), cmap='viridis', aspect='auto',
+                   extent=[times[0], times[-1], times[0], times[-1]])
+        plt.title('Self-Similarity Matrix')
+        plt.xlabel('Time (s)')
+        plt.ylabel('Time (s)')
+
+        # Third subplot: (Empty or other content, if needed)
+        plt.subplot(2, 2, 3)
+        plt.axis('off')  # Hide if not used
+
+        # Fourth subplot: Flipped pitch vs time
+        plt.subplot(2, 2, 4)
+        plt.plot(times, pitch)
+        plt.xticks([])
+        plt.yticks([])
+
         plt.tight_layout()
-        plt.savefig('spectrogram_with_pitch.png')
+        plt.savefig("self_similarity_matrix.png")
         plt.close()
-
-        return pitch
