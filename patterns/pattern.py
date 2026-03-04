@@ -3,7 +3,6 @@ import torchaudio
 import numpy as np
 import matplotlib.pyplot as plt
 from utils.dataset import Dataset
-# import cosine Similarity
 from sklearn.metrics.pairwise import cosine_similarity
 
 class Pattern:
